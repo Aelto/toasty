@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-dynamodb-v0.7.0...toasty-driver-dynamodb-v0.8.0) - 2026-06-08
+
+### Added
+
+- add between operator to query DSL ([#1029](https://github.com/tokio-rs/toasty/pull/1029))
+- support Option<EmbeddedType> model fields ([#1021](https://github.com/tokio-rs/toasty/pull/1021))
+- support composite unique indices ([#1018](https://github.com/tokio-rs/toasty/pull/1018))
+
+### Fixed
+
+- *(dynamodb)* encode bool values as N("1"/"0") to match key attribute type ([#945](https://github.com/tokio-rs/toasty/pull/945))
+
+### Other
+
+- *(core)* [**breaking**] make UpdateByKey returning columns explicit ([#1024](https://github.com/tokio-rs/toasty/pull/1024))
 ## [0.7.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-dynamodb-v0.6.1...toasty-driver-dynamodb-v0.7.0) - 2026-05-29
 
 ### Added

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/tokio-rs/toasty/compare/toasty-v0.7.0...toasty-v0.8.0) - 2026-06-08
+
+### Added
+
+- Serde serialization and deserialization for `toasty::Json<T>` ([#1035])
+- Index support on unit enums ([#1027])
+- `between` operator for query DSL ([#1029])
+- Support for `Option<EmbeddedType>` model fields ([#1021])
+- Support for scalar terminal fields in `has_many` ([#1012])
+
+### Fixed
+
+- Increment `#[version]` field on query-based updates ([#1022])
+
+### Changed
+
+- [**breaking**] `UpdateByKey` now requires explicit returning columns ([#1024])
+- [**breaking**] Renamed `RelationManyField`/`RelationOneField` assoc type to `Target` ([#1015])
+- [**breaking**] Aligned `stmt::Query` with per-model `Query` ([#1011])
+- [**breaking**] Unified per-model query structs into `Query<T>` ([#995])
+- [**breaking**] Removed the `Register` trait ([#1006])
+- [**breaking**] Removed compile-time field validation from `create!` macro ([#997])
+
+[#995]: https://github.com/tokio-rs/toasty/pull/995
+[#997]: https://github.com/tokio-rs/toasty/pull/997
+[#1006]: https://github.com/tokio-rs/toasty/pull/1006
+[#1011]: https://github.com/tokio-rs/toasty/pull/1011
+[#1012]: https://github.com/tokio-rs/toasty/pull/1012
+[#1015]: https://github.com/tokio-rs/toasty/pull/1015
+[#1021]: https://github.com/tokio-rs/toasty/pull/1021
+[#1022]: https://github.com/tokio-rs/toasty/pull/1022
+[#1024]: https://github.com/tokio-rs/toasty/pull/1024
+[#1027]: https://github.com/tokio-rs/toasty/pull/1027
+[#1029]: https://github.com/tokio-rs/toasty/pull/1029
+[#1035]: https://github.com/tokio-rs/toasty/pull/1035
+
 ## [0.7.0](https://github.com/tokio-rs/toasty/compare/toasty-v0.6.1...toasty-v0.7.0) - 2026-05-29
 
 ### Added

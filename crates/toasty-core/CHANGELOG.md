@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/tokio-rs/toasty/compare/toasty-core-v0.7.0...toasty-core-v0.8.0) - 2026-06-08
+
+### Added
+
+- Allow index on unit enum ([#1027])
+- Add between operator to query DSL ([#1029])
+- Support Option<EmbeddedType> model fields ([#1021])
+- Support scalar terminal fields in has_many via ([#1012])
+
+### Fixed
+
+- Auto-generated index names are now truncated to fit backend limits ([#1023])
+- DynamoDB bool values in key attributes are now encoded correctly ([#945])
+
+### Changed
+
+- [**breaking**] UpdateByKey now requires explicit returning columns specification ([#1024])
+
+[#945]: https://github.com/tokio-rs/toasty/pull/945
+[#1012]: https://github.com/tokio-rs/toasty/pull/1012
+[#1021]: https://github.com/tokio-rs/toasty/pull/1021
+[#1023]: https://github.com/tokio-rs/toasty/pull/1023
+[#1024]: https://github.com/tokio-rs/toasty/pull/1024
+[#1027]: https://github.com/tokio-rs/toasty/pull/1027
+[#1029]: https://github.com/tokio-rs/toasty/pull/1029
+
 ## [0.7.0](https://github.com/tokio-rs/toasty/compare/toasty-core-v0.6.1...toasty-core-v0.7.0) - 2026-05-29
 
 ### Added

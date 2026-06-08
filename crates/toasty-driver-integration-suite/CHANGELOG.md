@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-integration-suite-v0.7.0...toasty-driver-integration-suite-v0.8.0) - 2026-06-08
+
+### Added
+
+- Index on unit enum ([#1027])
+- Between operator in query DSL ([#1029])
+- Option<EmbeddedType> model fields ([#1021])
+- Composite unique indices ([#1018])
+- Scalar terminal fields in has_many relationships ([#1012])
+
+### Fixed
+
+- Auto-generated index names now respect backend limits ([#1023])
+- #[version] field increments on query-based updates ([#1022])
+- DynamoDB boolean encoding matches key attribute types ([#945])
+
+### Changed
+
+- [**breaking**] UpdateByKey now requires explicit returning columns ([#1024])
+- [**breaking**] Query structs unified to single Query<T> ([#995])
+- [**breaking**] Register trait removed ([#1006])
+
+[#945]: https://github.com/tokio-rs/toasty/pull/945
+[#995]: https://github.com/tokio-rs/toasty/pull/995
+[#1006]: https://github.com/tokio-rs/toasty/pull/1006
+[#1012]: https://github.com/tokio-rs/toasty/pull/1012
+[#1018]: https://github.com/tokio-rs/toasty/pull/1018
+[#1021]: https://github.com/tokio-rs/toasty/pull/1021
+[#1022]: https://github.com/tokio-rs/toasty/pull/1022
+[#1023]: https://github.com/tokio-rs/toasty/pull/1023
+[#1024]: https://github.com/tokio-rs/toasty/pull/1024
+[#1027]: https://github.com/tokio-rs/toasty/pull/1027
+[#1029]: https://github.com/tokio-rs/toasty/pull/1029
+
 ## [0.7.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-integration-suite-v0.6.1...toasty-driver-integration-suite-v0.7.0) - 2026-05-29
 
 ### Added

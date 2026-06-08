@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-turso-v0.7.0...toasty-driver-turso-v0.8.0) - 2026-06-08
+
+### Added
+
+- Add Serde support for toasty::Json<T> ([#1035])
+
+[#1035]: https://github.com/tokio-rs/toasty/pull/1035
+
 ## [0.7.0](https://github.com/tokio-rs/toasty/compare/toasty-driver-turso-v0.6.1...toasty-driver-turso-v0.7.0) - 2026-05-29
 
 ### Added
