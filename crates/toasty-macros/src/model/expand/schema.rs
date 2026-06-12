@@ -381,17 +381,10 @@ impl Expand<'_> {
             let col_ty = field.attrs.column.as_ref().and_then(|c| c.ty.as_ref())?;
             let marker = col_ty.compat_marker(toasty)?;
 
-            // Pin the diagnostic at the field type's span so the error lands
-            // on the user's declaration, not the derive call site.
-            Some(quote_spanned! { ty.span()=>
-                const _: () = {
-                    fn _check<__T>()
-                    where
-                        __T: #toasty::storage::CompatibleWith<#marker>,
-                    {}
-                    let _ = _check::<#ty>;
-                };
-            })
+            Some(compat_check(
+                ty,
+                quote! { #toasty::storage::CompatibleWith<#marker> },
+            ))
         });
 
         quote! { #( #checks )* }
@@ -420,17 +413,10 @@ impl Expand<'_> {
                 AutoStrategy::Increment => quote! { #toasty::auto::tag::Increment },
             };
 
-            // Pin the diagnostic at the field type's span so the error lands
-            // on the user's declaration, not the derive call site.
-            Some(quote_spanned! { ty.span()=>
-                const _: () = {
-                    fn _check<__T>()
-                    where
-                        __T: #toasty::auto::AutoCompatible<#tag>,
-                    {}
-                    let _ = _check::<#ty>;
-                };
-            })
+            Some(compat_check(
+                ty,
+                quote! { #toasty::auto::AutoCompatible<#tag> },
+            ))
         });
 
         quote! { #( #checks )* }
@@ -455,13 +441,56 @@ impl Expand<'_> {
                 return None;
             };
 
-            Some(quote_spanned! { ty.span()=>
-                const _: () = {
-                    fn _check<__T: #toasty::Version>() {}
-                    let _ = _check::<#ty>;
-                };
-            })
+            Some(compat_check(ty, quote! { #toasty::Version }))
         });
+
+        quote! { #( #checks )* }
+    }
+
+    /// Emit one obligation per field that participates in a secondary index or
+    /// unique constraint (`#[index]`, `#[unique]`, or a model-level
+    /// `#[index(...)]` / `#[unique(...)]`) that the field's Rust type implements
+    /// `codegen_support::index::IndexableField`.
+    ///
+    /// Scalars satisfy the bound directly; newtype embeds via the `NewtypeOf`
+    /// blanket; unit (data-less) enums via the impl emitted by
+    /// `#[derive(Embed)]`. Data-carrying enums and multi-field embedded structs
+    /// span multiple columns and do not implement it, so naming one in an index
+    /// is a compile error instead of a runtime panic.
+    ///
+    /// The primary key is excluded: keys are validated through their own paths.
+    pub(super) fn expand_indexable_checks(&self) -> TokenStream {
+        let toasty = &self.toasty;
+
+        let mut seen = std::collections::BTreeSet::new();
+        let checks = self
+            .model
+            .indices
+            .iter()
+            .filter(|index| !index.primary_key)
+            .flat_map(|index| index.fields.iter())
+            .filter_map(|index_field| {
+                if !seen.insert(index_field.field) {
+                    return None;
+                }
+
+                let FieldTy::Primitive(ty) = &self.model.fields[index_field.field].ty else {
+                    return None;
+                };
+
+                // Pin the diagnostic at the field type's span so the error
+                // lands on the user's declaration, not the derive call site.
+                Some(quote_spanned! { ty.span()=>
+                    const _: () = {
+                        fn _check<__T>()
+                        where
+                            __T: #toasty::index::IndexableField,
+                        {}
+                        let _ = _check::<#ty>;
+                    };
+                })
+            })
+            .collect::<Vec<_>>();
 
         quote! { #( #checks )* }
     }
@@ -513,6 +542,26 @@ impl Expand<'_> {
                 }
             })
             .collect()
+    }
+}
+
+/// Emit a span-pinned compile-time obligation that `ty` satisfies `bound`.
+///
+/// The check leans on the type checker rather than inspecting `ty`: the
+/// zero-cost `_check::<#ty>` reference forces the bound to hold. `quote_spanned`
+/// pins any resulting diagnostic at the field type's span so the error lands on
+/// the user's declaration, not the derive call site. Shared by the
+/// storage/auto/version `expand_*_compat_checks` expansions, which differ only
+/// in the `bound` they require.
+fn compat_check(ty: &syn::Type, bound: TokenStream) -> TokenStream {
+    quote_spanned! { ty.span()=>
+        const _: () = {
+            fn _check<__T>()
+            where
+                __T: #bound,
+            {}
+            let _ = _check::<#ty>;
+        };
     }
 }
 
