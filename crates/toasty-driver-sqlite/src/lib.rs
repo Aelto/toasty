@@ -60,7 +60,10 @@ enum SqlReturn {
 #[derive(Debug)]
 pub enum Sqlite {
     /// A database stored at a filesystem path.
-    File(PathBuf),
+    File {
+        path: PathBuf,
+        pragmas: Vec<(&'static str, &'static str)>,
+    },
     /// An ephemeral in-memory database.
     InMemory,
 }
@@ -81,7 +84,10 @@ impl Sqlite {
         if url.path() == ":memory:" {
             Ok(Self::InMemory)
         } else {
-            Ok(Self::File(PathBuf::from(url.path())))
+            Ok(Self::File {
+                path: PathBuf::from(url.path()),
+                pragmas: Vec::new(),
+            })
         }
     }
 
@@ -91,8 +97,11 @@ impl Sqlite {
     }
 
     /// Open a SQLite database at the specified file path
-    pub fn open<P: AsRef<Path>>(path: P) -> Self {
-        Self::File(path.as_ref().to_path_buf())
+    pub fn open<P: AsRef<Path>>(path: P, pragmas: &[(&'static str, &'static str)]) -> Self {
+        Self::File {
+            path: path.as_ref().to_path_buf(),
+            pragmas: Vec::from(pragmas),
+        }
     }
 }
 
@@ -101,7 +110,7 @@ impl Driver for Sqlite {
     fn url(&self) -> Cow<'_, str> {
         match self {
             Sqlite::InMemory => Cow::Borrowed("sqlite::memory:"),
-            Sqlite::File(path) => Cow::Owned(format!("sqlite:{}", path.display())),
+            Sqlite::File { path, pragmas: _ } => Cow::Owned(format!("sqlite:{}", path.display())),
         }
     }
 
@@ -111,7 +120,15 @@ impl Driver for Sqlite {
 
     async fn connect(&self) -> toasty_core::Result<Box<dyn toasty_core::Connection>> {
         let connection = match self {
-            Sqlite::File(path) => Connection::open(path)?,
+            Sqlite::File { path, pragmas } => {
+                let conn = Connection::open(path)?;
+
+                for pragma in pragmas {
+                    conn.pragma_update(pragma.0, pragma.1)?;
+                }
+
+                conn
+            }
             Sqlite::InMemory => Connection::in_memory(),
         };
         Ok(Box::new(connection))
@@ -134,7 +151,7 @@ impl Driver for Sqlite {
 
     async fn reset_db(&self) -> toasty_core::Result<()> {
         match self {
-            Sqlite::File(path) => {
+            Sqlite::File { path, pragmas: _ } => {
                 // Delete the file and recreate it
                 if path.exists() {
                     std::fs::remove_file(path)
@@ -423,6 +440,19 @@ impl Connection {
                 .execute(&stmt, [])
                 .map_err(toasty_core::Error::driver_operation_failed)?;
         }
+        Ok(())
+    }
+
+    /// Set a new value to pragma_name.
+    /// Some pragmas will return the updated value which cannot be retrieved with this method.
+    pub fn pragma_update<V>(&self, pragma_name: &str, pragma_value: V) -> Result<()>
+    where
+        V: rusqlite::ToSql,
+    {
+        self.connection
+            .pragma_update(None, pragma_name, pragma_value)
+            .map_err(toasty_core::Error::driver_operation_failed)?;
+
         Ok(())
     }
 }
