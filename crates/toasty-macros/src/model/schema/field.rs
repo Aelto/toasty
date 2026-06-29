@@ -136,7 +136,7 @@ impl FieldAttr {
                         Err(e) => errs.push(e),
                     }
                 }
-            } else if attr.path().is_ident("default") {
+            } else if attr.path().is_ident("toasty_default") {
                 if field_attr.default_expr.is_some() {
                     errs.push(syn::Error::new_spanned(
                         attr,
