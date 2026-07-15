@@ -130,7 +130,31 @@ impl Expand<'_> {
 
                     nullable = quote!(<#ty as #toasty::Field>::NULLABLE);
                     deferred = quote!(<#ty as #toasty::Field>::DEFERRED);
-                    field_ty = quote!(<#ty as #toasty::Field>::field_ty(#storage_ty));
+
+                    // A `#[document]` field is stored as a single JSON column.
+                    // Its app type resolves through the `Document` trait —
+                    // `Model(id)` for a struct embed, `List(Model(id))` for a
+                    // `Vec<embed>` collection — which the schema builder later
+                    // resolves to a `Document` once every embed is registered.
+                    // The trait bound also rejects `#[document]` on any type
+                    // that cannot use document storage (a scalar, an enum
+                    // embed, a `Vec<scalar>`) at compile time. A non-document
+                    // field uses `Field::field_ty`, which column-expands a
+                    // struct embed (`Embedded`) and leaves scalars /
+                    // `Vec<scalar>` as a `Primitive`.
+                    field_ty = if field.attrs.document.is_some() {
+                        quote! {
+                            #toasty::core::schema::app::FieldTy::Primitive(
+                                #toasty::core::schema::app::FieldPrimitive {
+                                    ty: <#ty as #toasty::Document>::document_ty(),
+                                    storage_ty: #storage_ty,
+                                    serialize: None,
+                                }
+                            )
+                        }
+                    } else {
+                        quote!(<#ty as #toasty::Field>::field_ty(#storage_ty))
+                    };
                 }
                 FieldTy::BelongsTo(rel) => {
                     let ty = &rel.ty;
@@ -250,6 +274,7 @@ impl Expand<'_> {
                     deferred: #deferred,
                     constraints: vec![],
                     variant: None,
+                    shared: None,
                 }
             }
         });
@@ -353,12 +378,16 @@ impl Expand<'_> {
     }
 
     fn expand_table_name(&self) -> TokenStream {
-        if let Some(table_name) = &self.model.table {
-            let table_name = table_name.value();
-            quote! { Some(#table_name.to_string()) }
-        } else {
-            quote! { None }
-        }
+        let table_name = match &self.model.table {
+            Some(table_name) => table_name.value(),
+            // Derive the default table name at compile time so building the
+            // schema at runtime never pays the cost of the `pluralizer` crate's
+            // lazy regex compilation: snake_case the model name, then pluralize.
+            // The table-name prefix, if any, is applied at runtime by the builder.
+            None => pluralizer::pluralize(&self.model.name.snake_case, 2, false),
+        };
+
+        quote! { #table_name.to_string() }
     }
 }
 
@@ -509,8 +538,9 @@ impl Expand<'_> {
             .iter()
             .map(|field| match &field.ty {
                 FieldTy::Primitive(ty) => {
-                    // Primitives use Field::register which delegates to inner
-                    // type if it's an embedded type (via the Field impl).
+                    // Both column-expanded embeds and `#[document]` fields
+                    // register their embedded types through `Field::register`
+                    // (a no-op for scalars).
                     quote! {
                         <#ty as #toasty::Field>::register(model_set);
                     }

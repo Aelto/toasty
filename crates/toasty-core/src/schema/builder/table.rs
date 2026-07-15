@@ -52,6 +52,46 @@ struct BuildMapping<'a> {
     lowering_columns: Vec<ColumnId>,
     model_to_table: Vec<stmt::Expr>,
     table_to_model: Vec<stmt::Expr>,
+    /// Column-sharing registry, active only while mapping the variant fields of
+    /// an embedded enum. `None` outside an enum's variant mapping. Saved and
+    /// restored around each enum so `#[shared]` identifiers are scoped to a
+    /// single enum's variants (and never leak across nested enums); the
+    /// physical column `names` a nested enum creates are merged back into the
+    /// outer registry on restore, since they live in the parent's namespace.
+    enum_columns: Option<EnumColumns>,
+}
+
+/// Per-enum column bookkeeping, active while mapping an embedded enum's
+/// variant fields.
+#[derive(Default)]
+struct EnumColumns {
+    /// Maps a shared logical-field identifier (`#[shared(<ident>)]`) to the
+    /// column an earlier variant already created for it, so later variants
+    /// declaring the same identifier share that column instead of producing a
+    /// duplicate.
+    shared: std::collections::HashMap<Name, SharedColumn>,
+
+    /// Every flattened column name created so far for this enum's variant
+    /// fields. Sharing is always explicit: two fields resolving to the same
+    /// column name without a common `#[shared]` identifier is an invalid
+    /// schema, not an implicit merge.
+    names: std::collections::HashSet<String>,
+}
+
+/// A column created by an earlier enum variant that later variants may reuse.
+#[derive(Clone)]
+struct SharedColumn {
+    column: ColumnId,
+    /// Index into `model_to_table` of the column's encode expression. Later
+    /// variants merge their discriminant-guarded arm into this `Match`.
+    lowering: usize,
+    /// App type of the field that first created the column. Reused fields must
+    /// match it exactly so the column needs no per-variant casting.
+    ty: stmt::Type,
+    /// Discriminant of the variant that created the column. Reuse is only sound
+    /// across *different* variants; a field in the same variant reaching the same
+    /// column is an invalid mapping (both would be active for one discriminant).
+    variant_discriminant: Option<stmt::Value>,
 }
 
 /// Per-level state for the recursive `map_field*` methods.
@@ -103,26 +143,24 @@ struct MapField<'a, 'b> {
     /// column. ORed into the column's flag at creation time so an outer or
     /// inner declaration both take effect.
     inherited_auto_increment: bool,
+
+    /// Discriminant of the enum variant currently being mapped, set by
+    /// [`Self::for_variant`] and inherited by nested embeds within the variant.
+    /// `None` outside an enum variant. Used to distinguish a sound cross-variant
+    /// column share from an invalid same-variant collision.
+    variant_discriminant: Option<stmt::Value>,
 }
 
 impl BuildSchema<'_> {
     pub(super) fn build_table_stub_for_model(&mut self, model: &ModelRoot) -> TableId {
-        if let Some(table_name) = model.table_name.as_ref() {
-            let table_name = self.prefix_table_name(table_name);
+        let table_name = self.prefix_table_name(&model.table_name);
 
-            if !self.table_lookup.contains_key(&table_name) {
-                let id = self.register_table(&table_name);
-                self.tables.push(Table::new(id, table_name.clone()));
-            }
-
-            *self.table_lookup.get(&table_name).unwrap()
-        } else {
-            let name = self.table_name_from_model(&model.name);
-            let id = self.register_table(&name);
-
-            self.tables.push(Table::new(id, name));
-            id
+        if !self.table_lookup.contains_key(&table_name) {
+            let id = self.register_table(&table_name);
+            self.tables.push(Table::new(id, table_name.clone()));
         }
+
+        *self.table_lookup.get(&table_name).unwrap()
     }
 
     pub(super) fn build_tables_from_models(
@@ -163,11 +201,6 @@ impl BuildSchema<'_> {
         id
     }
 
-    fn table_name_from_model(&self, model_name: &Name) -> String {
-        let base = pluralizer::pluralize(&model_name.snake_case(), 2, false);
-        self.prefix_table_name(&base)
-    }
-
     fn prefix_table_name(&self, name: &str) -> String {
         if let Some(prefix) = &self.builder.table_name_prefix {
             format!("{prefix}{name}")
@@ -203,6 +236,7 @@ impl BuildTableFromModels<'_> {
             lowering_columns: vec![],
             model_to_table: vec![],
             table_to_model: vec![],
+            enum_columns: None,
         }
         .build_mapping(root)?;
 
@@ -703,6 +737,29 @@ impl BuildMapping<'_> {
         lowering_index
     }
 
+    /// Merges a later variant field's encode into the shared column's existing
+    /// encode at `lowering`, so one column encodes every contributing variant.
+    ///
+    /// Both encodes are produced by [`MapField::for_variant`], so each is a
+    /// discriminant-guarded `Match` (optionally wrapped in a `Cast`) whose arm
+    /// fires only for that variant. Appending `new_encode`'s arm to the existing
+    /// `Match` yields `match disc { d1 => v1, d2 => v2, .. } else null` — exactly
+    /// the per-variant dispatch a shared column needs.
+    fn merge_shared_encode(&mut self, lowering: usize, new_encode: stmt::Expr) -> Result<()> {
+        let new_arms = into_match_arms(new_encode).ok_or_else(|| {
+            Error::invalid_schema(
+                "shared enum column encode is not a discriminant match expression",
+            )
+        })?;
+        let existing = match_arms_mut(&mut self.model_to_table[lowering]).ok_or_else(|| {
+            Error::invalid_schema(
+                "shared enum column encode is not a discriminant match expression",
+            )
+        })?;
+        existing.extend(new_arms);
+        Ok(())
+    }
+
     fn encode_column(
         &self,
         column_id: ColumnId,
@@ -716,6 +773,12 @@ impl BuildMapping<'_> {
 
         match &column.ty {
             column_ty if column_ty == ty => expr,
+            // A `#[document]` column lowers through a schema-directed cast.
+            // The structural target (`Object`) does not name the embedded
+            // model and a positional record is not self-describing, so the
+            // cast carries the model-level source type (see
+            // `stmt::ExprCast::from`).
+            _ if column.is_document() => stmt::Expr::cast_from(expr, ty, &column.ty),
             // If the types do not match, attempt casting as a fallback.
             _ => stmt::Expr::cast(expr, &column.ty),
         }
@@ -743,7 +806,10 @@ impl BuildMapping<'_> {
 
         match &column.ty {
             c_ty if *c_ty == primitive.ty => expr_column,
-            // If the types do not match, attempt casting as a fallback.
+            // If the types do not match, attempt casting as a fallback. A
+            // `#[document]` column takes this path too: the raising cast
+            // (`Object` → `Model`) turns the driver's named wire object into
+            // the embed's positional record when the engine evaluates it.
             _ => stmt::Expr::cast(expr_column, &primitive.ty),
         }
     }
@@ -842,6 +908,7 @@ impl<'a, 'b> MapField<'a, 'b> {
             field_base: None,
             field_expr_base: stmt::Expr::arg(0),
             inherited_auto_increment: false,
+            variant_discriminant: None,
         }
     }
 
@@ -854,10 +921,18 @@ impl<'a, 'b> MapField<'a, 'b> {
     }
 
     fn map_field(&mut self, index: usize, field: &app::Field) -> Result<mapping::Field> {
+        // A shared logical field maps to exactly one column, so only
+        // single-column (primitive) fields can participate in sharing.
+        if field.shared.is_some() && !matches!(&field.ty, app::FieldTy::Primitive(_)) {
+            return Err(Error::invalid_schema(format!(
+                "field `{}` declares a shared field but is not a primitive; \
+                 only single-column fields can share a column",
+                field.name,
+            )));
+        }
+
         match &field.ty {
-            app::FieldTy::Primitive(primitive) => {
-                Ok(self.map_field_primitive(index, field, primitive))
-            }
+            app::FieldTy::Primitive(primitive) => self.map_field_primitive(index, field, primitive),
             app::FieldTy::Embedded(embedded) => {
                 let target = lookup_embedded_model(self.build.app, embedded.target, field)?;
 
@@ -882,26 +957,122 @@ impl<'a, 'b> MapField<'a, 'b> {
     }
 
     /// Creates the column and builds the mapping for a primitive field in one step.
+    ///
+    /// When column sharing is active (i.e. mapping enum variant fields) and an
+    /// earlier variant already created the column for this field's `#[shared]`
+    /// identifier, this reuses that column — merging the field's
+    /// discriminant-guarded encode into the shared column's `Match` — instead
+    /// of creating a duplicate. Sharing is always explicit: without a common
+    /// `#[shared]` identifier, two variant fields resolving to the same column
+    /// name are a duplicate-column error, never an implicit merge.
     fn map_field_primitive(
         &mut self,
         field_index: usize,
         field: &app::Field,
         primitive: &app::FieldPrimitive,
-    ) -> mapping::Field {
-        let column_id = self.create_column(field, primitive);
+    ) -> Result<mapping::Field> {
         let expr = self.field_expr(field, field_index);
-        let lowering_index = self.build.push_lowering(column_id, &primitive.ty, expr);
+        let column_name = self.column_name(field);
+
+        let shared = field.shared.as_ref().and_then(|ident| {
+            self.build
+                .enum_columns
+                .as_ref()
+                .and_then(|columns| columns.shared.get(ident).cloned())
+        });
+
+        let (column_id, lowering_index) = if let Some(shared) = shared {
+            let ident = field.shared.as_ref().unwrap().snake_case();
+
+            // Reuse is only sound across *different* variants — the merged encode
+            // dispatches on the discriminant, and at most one variant is active
+            // per row. Two fields in the *same* variant reaching one column would
+            // append a second arm under the same discriminant, so the encode
+            // would silently keep only the first and both fields would decode from
+            // the one column. Reject that invalid mapping. The `Embed` derive
+            // catches it at compile time; this is the backstop for schemas built
+            // without the macro.
+            if shared.variant_discriminant.is_some()
+                && shared.variant_discriminant == self.variant_discriminant
+            {
+                return Err(Error::invalid_schema(format!(
+                    "two fields in the same enum variant declare `#[shared({ident})]`; \
+                     a column can be shared only across different variants",
+                )));
+            }
+
+            // A shared column needs no per-variant casting, so the contributing
+            // fields must have identical types. The `Embed` derive rejects a
+            // mismatch at compile time via `SameColumnType`; this is the
+            // backstop for schemas built without the macro. Width or kind
+            // mismatches (e.g. `i32` vs `i64`, or `String` vs `i64`) are
+            // rejected here rather than silently coerced.
+            if shared.ty != primitive.ty {
+                return Err(Error::invalid_schema(format!(
+                    "enum variant fields sharing `{ident}` have incompatible types \
+                     ({:?} and {:?}); fields sharing a column must have the same type",
+                    shared.ty, primitive.ty,
+                )));
+            }
+
+            // Every sharing field must resolve to the same column name; a
+            // `#[column("...")]` override on one variant that disagrees with
+            // another's is an error, not two columns. The `Embed` derive
+            // rejects this at compile time; this is the backstop.
+            let existing = &self.build.table.column(shared.column).name;
+            if *existing != column_name {
+                return Err(Error::invalid_schema(format!(
+                    "enum variant fields sharing `{ident}` resolve to different \
+                     column names (`{existing}` and `{column_name}`); fields sharing \
+                     a column must agree on the column name",
+                )));
+            }
+
+            self.build.merge_shared_encode(shared.lowering, expr)?;
+            (shared.column, shared.lowering)
+        } else {
+            if let Some(columns) = &self.build.enum_columns
+                && columns.names.contains(&column_name)
+            {
+                return Err(Error::invalid_schema(format!(
+                    "two enum variant fields map to the column `{column_name}` \
+                     without declaring a shared field; annotate both with \
+                     `#[shared(<ident>)]` to share the column",
+                )));
+            }
+
+            let column_id = self.create_column(field, primitive);
+            let lowering_index = self.build.push_lowering(column_id, &primitive.ty, expr);
+
+            if let Some(columns) = self.build.enum_columns.as_mut() {
+                columns.names.insert(column_name);
+                if let Some(ident) = &field.shared {
+                    columns.shared.insert(
+                        ident.clone(),
+                        SharedColumn {
+                            column: column_id,
+                            lowering: lowering_index,
+                            ty: primitive.ty.clone(),
+                            variant_discriminant: self.variant_discriminant.clone(),
+                        },
+                    );
+                }
+            }
+
+            (column_id, lowering_index)
+        };
+
         let bit = self.build.next_bit();
         let sub_projection = self.sub_projection(field_index);
         let column_expr = self.build.map_table_column_to_model(column_id, primitive);
 
-        mapping::Field::Primitive(mapping::FieldPrimitive {
+        Ok(mapping::Field::Primitive(mapping::FieldPrimitive {
             column: column_id,
             lowering: lowering_index,
             field_mask: stmt::PathFieldSet::from_iter([bit]),
             sub_projection,
             column_expr,
-        })
+        }))
     }
 
     /// Creates the discriminant and variant-field columns, then builds the
@@ -915,6 +1086,20 @@ impl<'a, 'b> MapField<'a, 'b> {
         // Create the discriminant column. It inherits nullability from the enum field.
         let column_id = self.create_column(field, &embedded_enum.discriminant);
         let field_expr = self.field_expr(field, field_index);
+
+        // A nested enum's discriminant column lives in the parent enum's
+        // column namespace; record it so a later variant field of the parent
+        // resolving to the same name is caught as a duplicate.
+        if let Some(columns) = self.build.enum_columns.as_mut() {
+            let column_name = self.build.table.column(column_id).name.clone();
+            if !columns.names.insert(column_name.clone()) {
+                return Err(Error::invalid_schema(format!(
+                    "two enum variant fields map to the column `{column_name}` \
+                     without declaring a shared field; annotate both with \
+                     `#[shared(<ident>)]` to share the column",
+                )));
+            }
+        }
 
         // For data-carrying enums the model value is Record([I64(disc), ...]),
         // so project [0] to extract the discriminant; for unit-only enums the
@@ -934,7 +1119,24 @@ impl<'a, 'b> MapField<'a, 'b> {
 
         let disc_proj = stmt::Expr::project(field_expr.clone(), stmt::Projection::single(0));
 
-        let variants = embedded_enum
+        // Activate a fresh column-sharing registry for this enum's variant
+        // fields. A nested enum installs (and restores) its own, so sharing
+        // never crosses enum boundaries — but the physical `names` are seeded
+        // from the outer registry, since a nested enum's columns live in the
+        // parent's namespace and must collide against columns the outer enum
+        // already created. Restored after the variants are mapped.
+        let inner = EnumColumns {
+            shared: Default::default(),
+            names: self
+                .build
+                .enum_columns
+                .as_ref()
+                .map(|outer| outer.names.clone())
+                .unwrap_or_default(),
+        };
+        let mut saved_shared = self.build.enum_columns.replace(inner);
+
+        let variants: Result<Vec<mapping::EnumVariant>> = embedded_enum
             .variants
             .iter()
             .enumerate()
@@ -957,7 +1159,18 @@ impl<'a, 'b> MapField<'a, 'b> {
                     fields,
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect();
+
+        // Restore the outer registry. Shared-identifier scoping stays local to
+        // this enum, but the physical column names it created live in the
+        // parent's namespace — merge them back so a later field of the outer
+        // enum colliding with a nested enum's column is still caught.
+        if let (Some(outer), Some(inner)) = (saved_shared.as_mut(), self.build.enum_columns.take())
+        {
+            outer.names.extend(inner.names);
+        }
+        self.build.enum_columns = saved_shared;
+        let variants = variants?;
 
         let field_mask = stmt::PathFieldSet::from_iter([bit]);
 
@@ -1160,11 +1373,22 @@ impl<'a, 'b> MapField<'a, 'b> {
     /// prepends `schema_prefix` (if any) with `__`. Because `schema_prefix` is
     /// applied here — never stored in `self.prefix` — it is always applied
     /// exactly once regardless of nesting depth.
+    ///
+    /// The field-name component prefers an explicit storage override, then the
+    /// shared logical-field identifier (so every variant of a `#[shared]`
+    /// group derives the same column name regardless of its Rust field name),
+    /// then the app name.
     fn column_name(&self, field: &app::Field) -> String {
-        let embed = match field.name.storage_name() {
+        let name = field
+            .name
+            .storage
+            .clone()
+            .or_else(|| field.shared.as_ref().map(Name::snake_case))
+            .or_else(|| field.name.app.clone());
+        let embed = match name {
             Some(field_name) => {
                 if self.prefix.is_empty() {
-                    field_name.to_owned()
+                    field_name
                 } else {
                     format!("{}_{field_name}", self.prefix.join("_"))
                 }
@@ -1307,6 +1531,9 @@ impl<'a, 'b> MapField<'a, 'b> {
             field_base: self.field_base.clone(),
             field_expr_base: self.field_expr_base.clone(),
             inherited_auto_increment: self.inherited_auto_increment,
+            // A nested embed stays within its enclosing variant, so it inherits
+            // the variant discriminant; `for_variant` overrides it per variant.
+            variant_discriminant: self.variant_discriminant.clone(),
         }
     }
 
@@ -1355,7 +1582,9 @@ impl<'a, 'b> MapField<'a, 'b> {
             }],
             stmt::Expr::null(),
         );
-        self.for_guarded_embed(field, field_index, guard)
+        let mut child = self.for_guarded_embed(field, field_index, guard);
+        child.variant_discriminant = Some(discriminant.clone());
+        child
     }
 
     /// Creates a child `MapField` for recursing into an embedded struct field.
@@ -1406,6 +1635,29 @@ impl<'a, 'b> MapField<'a, 'b> {
     fn for_nullable_struct(&mut self, field: &app::Field, field_index: usize) -> MapField<'_, 'b> {
         let guard = self.presence_guard(field, field_index, stmt::Expr::arg(0));
         self.for_guarded_embed(field, field_index, guard)
+    }
+}
+
+/// Returns a mutable reference to the arms of a discriminant-guarded encode,
+/// peeling a `Cast` wrapper if present. Used to merge a later variant field's
+/// arm into a shared column's existing `Match`.
+fn match_arms_mut(expr: &mut stmt::Expr) -> Option<&mut Vec<stmt::MatchArm>> {
+    match expr {
+        stmt::Expr::Match(m) => Some(&mut m.arms),
+        stmt::Expr::Cast(c) => match_arms_mut(&mut c.expr),
+        _ => None,
+    }
+}
+
+/// Consumes a discriminant-guarded encode, returning its arms (peeling a `Cast`
+/// wrapper if present). The subject and `else` branch are dropped: they are
+/// identical across the variants sharing a column, so the existing `Match`
+/// retains them.
+fn into_match_arms(expr: stmt::Expr) -> Option<Vec<stmt::MatchArm>> {
+    match expr {
+        stmt::Expr::Match(m) => Some(m.arms),
+        stmt::Expr::Cast(c) => into_match_arms(*c.expr),
+        _ => None,
     }
 }
 

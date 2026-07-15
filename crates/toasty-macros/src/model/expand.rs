@@ -1,4 +1,5 @@
 mod create;
+mod docs;
 mod embedded_enum;
 mod fields;
 mod filters;
@@ -184,6 +185,13 @@ pub(super) fn embedded_model(model: &Model) -> TokenStream {
             }
         }
 
+        // A struct embed can be stored as a `#[document]` column (an enum
+        // embed cannot, yet — its document encoding is undefined). The
+        // `#[document]` attribute resolves the field's type through this
+        // trait, so the bound is what rejects the attribute on
+        // non-document-capable types at compile time.
+        impl #toasty::Document for #model_ident {}
+
         impl #toasty::stmt::IntoExpr<#model_ident> for #model_ident {
             fn into_expr(self) -> #toasty::stmt::Expr<#model_ident> {
                 #into_expr_body_val
@@ -237,13 +245,17 @@ pub(super) fn embedded_enum(model: &Model) -> TokenStream {
     let enum_field_list_struct = e.expand_field_list_struct();
     let field_register_calls = e.expand_field_register_calls();
     let storage_compat_checks = e.expand_storage_compat_checks();
+    let shared_column_checks = e.expand_shared_column_checks();
     let indexable_checks = e.expand_indexable_checks();
 
-    // A unit (data-less) enum maps to a single discriminant column, so it can
-    // serve as an index column. Data-carrying enums span multiple columns and
-    // therefore do not implement `IndexableField`.
-    let indexable_impl = if model.fields.is_empty() {
-        quote! { impl #toasty::index::IndexableField for #model_ident {} }
+    // A unit (data-less) enum is a single scalar discriminant: indexable, and a
+    // valid `Vec<Enum>` element (`Scalar` unlocks the container operators).
+    // Data-carrying enums span multiple columns and get neither.
+    let unit_enum_impls = if model.fields.is_empty() {
+        quote! {
+            impl #toasty::index::IndexableField for #model_ident {}
+            impl #toasty::Scalar for #model_ident {}
+        }
     } else {
         quote! {}
     };
@@ -253,8 +265,9 @@ pub(super) fn embedded_enum(model: &Model) -> TokenStream {
         #enum_field_list_struct
 
         #storage_compat_checks
+        #shared_column_checks
         #indexable_checks
-        #indexable_impl
+        #unit_enum_impls
 
         impl #toasty::Embed for #model_ident {
             fn id() -> #toasty::core::schema::app::ModelId {
@@ -452,8 +465,12 @@ impl Expand<'_> {
         }
     }
 
-    /// Generates a field accessor method for a primitive field using the
-    /// `Field::new_path` trait.
+    /// Generates a field accessor method for a primitive field, resolving the
+    /// path shape through the field type's [`Field`] impl — its `Path` /
+    /// `new_path` / `ExprTarget`. The type itself decides its path shape (a
+    /// struct embed's Fields handle, a `Vec<scalar>` / `Vec<Embed>` list leaf)
+    /// without the macro inspecting the Rust type. A `#[document]` field uses
+    /// the same `Field` impl as its column-expanded form.
     fn expand_primitive_field_method(
         &self,
         field_ident: &syn::Ident,
@@ -468,8 +485,8 @@ impl Expand<'_> {
 
         // Construct the chained path with the field's `ExprTarget` as the
         // tag, so `new_path` receives exactly the type it expects. For
-        // `Vec<scalar>` this is
-        // `List<T>`; for everything else it is the field's Rust type.
+        // `Vec<_>` this is `List<T>`; for everything else it is the field's
+        // Rust type.
         quote_spanned! { span=>
             #vis fn #field_ident(&self) -> <#ty as #toasty::Field>::Path<__Origin> {
                 <#ty as #toasty::Field>::new_path(
