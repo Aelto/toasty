@@ -145,7 +145,7 @@ rustls-pemfile = "2"
 rustls-webpki = { version = "0.103", default-features = false, features = ["alloc", "std"] }
 tokio-stream = { version = "0.1.18", default-features = false }
 tracing = "0.1"
-turso = "0.6"
+turso = "0.7"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = { version = "1.0.116", features = ["diff"] }
 url = "2.5.8"
