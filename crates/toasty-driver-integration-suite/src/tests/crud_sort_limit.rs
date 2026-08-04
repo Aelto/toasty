@@ -4,10 +4,10 @@ use crate::prelude::*;
 use toasty::stmt::Page;
 use toasty_core::{
     driver::{Operation, Rows},
-    stmt::{ExprSet, Statement},
+    stmt::{Expr, ExprSet, Limit, Statement, Value},
 };
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn sort_asc(test: &mut Test) -> Result<()> {
     let mut db = setup(test).await;
 
@@ -63,7 +63,7 @@ pub async fn sort_asc(test: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn paginate(test: &mut Test) -> Result<()> {
     let mut db = setup(test).await;
 
@@ -129,7 +129,7 @@ pub async fn paginate(test: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn limit_offset(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -202,7 +202,7 @@ pub async fn limit_offset(t: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn first_narrows_to_single_row(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -213,6 +213,7 @@ pub async fn first_narrows_to_single_row(t: &mut Test) -> Result<()> {
     ])
     .exec(&mut db)
     .await?;
+    t.log().clear();
 
     // Regression for https://github.com/tokio-rs/toasty/issues/692:
     // `.first()` on a query with multiple matching rows must return the first
@@ -224,6 +225,17 @@ pub async fn first_narrows_to_single_row(t: &mut Test) -> Result<()> {
         .await?;
     assert_struct!(youngest, Some(_ { name: "Bob", .. }));
 
+    let (op, _) = t.log().pop();
+    assert_struct!(op, Operation::QuerySql({
+        stmt: Statement::Query({
+            limit: Some(Limit::Offset({
+                limit: Expr::Static(== Value::I64(1)),
+                offset: None,
+            })),
+        }),
+        params: [{ value: == true }],
+    }));
+
     let oldest = User::all()
         .order_by(User::fields().age().desc())
         .first()
@@ -234,7 +246,7 @@ pub async fn first_narrows_to_single_row(t: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn order_by_multiple_columns_composes(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -262,7 +274,7 @@ pub async fn order_by_multiple_columns_composes(t: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn set_order_by_overwrites(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -288,7 +300,7 @@ pub async fn set_order_by_overwrites(t: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(id(ID), scenario(crate::scenarios::user_with_age), requires(sql))]
+#[driver_test(scenario(crate::scenarios::user_with_age), requires(sql))]
 pub async fn order_by_tuple(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 

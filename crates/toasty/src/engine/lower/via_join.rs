@@ -135,12 +135,9 @@ impl ViaJoin {
         // For a scalar terminal the path's last step is the projected field,
         // not a relation; the relation chain (which the JOIN walks) is
         // everything before it.
-        let projection = via.path.projection.as_slice();
-        let relation_steps = match via.terminal {
-            Some(_) => &projection[..projection.len() - 1],
-            None => projection,
-        };
-        let steps = flatten_via_steps(schema, root, relation_steps);
+        let steps = super::relation_path::flatten_via_path(schema, via)
+            .expect("via relation path must start at a model");
+        debug_assert_eq!(steps.first().map(|field| field.model), Some(root));
         assert!(
             !steps.is_empty(),
             "via path must have at least one step (validated at schema build time)"
@@ -256,52 +253,44 @@ impl Edge {
     }
 }
 
-/// Walk a via path, inlining any `via` field's own resolved path so the
-/// result is a flat sequence of direct relation `FieldId`s.
-fn flatten_via_steps(
-    schema: &toasty_core::Schema,
-    source_model_id: app::ModelId,
-    initial_steps: &[usize],
-) -> Vec<app::FieldId> {
-    let mut result = Vec::with_capacity(initial_steps.len());
-    let mut current_model = source_model_id;
-    let mut queue: Vec<usize> = initial_steps.to_vec();
-    queue.reverse(); // pop from the back
-
-    while let Some(idx) = queue.pop() {
-        let field = &schema.app.model(current_model).as_root_unwrap().fields[idx];
-        let field_id = app::FieldId {
-            model: current_model,
-            index: idx,
-        };
-
-        // If this step itself names a `via` relation, splice the nested
-        // path in place of it and continue (handles via-of-via naturally).
-        let nested_via = match &field.ty {
-            app::FieldTy::Via(via) => Some(via),
-            _ => None,
-        };
-        if let Some(via) = nested_via {
-            for step in via.path.projection.as_slice().iter().rev() {
-                queue.push(*step);
-            }
-            continue;
-        }
-
-        current_model = field
-            .relation_target_id()
-            .expect("via path step is a relation");
-        result.push(field_id);
-    }
-
-    result
+/// The single-column mapping for a foreign-key field.
+///
+/// Besides primitives, foreign keys may use embedded newtypes and unit enums.
+/// Newtypes map through one-field structs to a primitive leaf; unit enums map
+/// through their discriminant.
+struct SingleColumnFk<'a> {
+    primitive: &'a mapping::FieldPrimitive,
+    newtype_depth: usize,
 }
 
-/// The single-column mapping for a foreign-key field. Via include paths only
-/// resolve FK source/target fields, which the schema guarantees are primitive.
-fn fk_primitive(schema: &toasty_core::Schema, field_id: app::FieldId) -> &mapping::FieldPrimitive {
-    schema.mapping_for(field_id.model).fields[field_id.index]
-        .as_primitive()
+fn single_column_fk(schema: &toasty_core::Schema, field_id: app::FieldId) -> SingleColumnFk<'_> {
+    fn resolve(field: &mapping::Field) -> Option<SingleColumnFk<'_>> {
+        match field {
+            mapping::Field::Primitive(primitive) => Some(SingleColumnFk {
+                primitive,
+                newtype_depth: 0,
+            }),
+            mapping::Field::Struct(field) if field.fields.len() == 1 => {
+                let mut fk = resolve(&field.fields[0])?;
+                fk.newtype_depth += 1;
+                Some(fk)
+            }
+            mapping::Field::Enum(field)
+                if field
+                    .variants
+                    .iter()
+                    .all(|variant| variant.fields.is_empty()) =>
+            {
+                Some(SingleColumnFk {
+                    primitive: &field.discriminant,
+                    newtype_depth: 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    resolve(&schema.mapping_for(field_id.model).fields[field_id.index])
         .expect("FK field maps to a single column")
 }
 
@@ -311,22 +300,25 @@ fn fk_primitive(schema: &toasty_core::Schema, field_id: app::FieldId) -> &mappin
 fn raw_column(schema: &toasty_core::Schema, slot: usize, field_id: app::FieldId) -> stmt::Expr {
     stmt::Expr::column(stmt::ExprReference::column(
         slot,
-        fk_primitive(schema, field_id).column.index,
+        single_column_fk(schema, field_id).primitive.column.index,
     ))
 }
 
-/// The model-level expression for a FK field — its column reference wrapped in
-/// the storage→model cast when the storage type differs (e.g. `Uuid` stored as
-/// `Bytes`) — re-pointed at table `slot`.
+/// The single-column expression for a FK field, re-pointed at table `slot`.
 ///
-/// `FieldPrimitive::column_expr` is the schema's pre-built table→model
-/// expression at slot 0; we rewrite each column ref's slot.
+/// Primitive leaves and unit-enum discriminants use `column_expr` to preserve
+/// storage casts. This path does not use an embed's `default_returning`, which
+/// may contain nullable presence guards or deferred-field placeholders.
 fn model_level_column_expr(
     schema: &toasty_core::Schema,
     field_id: app::FieldId,
     slot: usize,
 ) -> stmt::Expr {
-    let mut expr = fk_primitive(schema, field_id).column_expr.clone();
+    let fk = single_column_fk(schema, field_id);
+    let mut expr = fk.primitive.column_expr.clone();
+    for _ in 0..fk.newtype_depth {
+        expr = stmt::Expr::record([expr]);
+    }
 
     stmt::visit_mut::for_each_expr_mut(&mut expr, |e| {
         if let stmt::Expr::Reference(stmt::ExprReference::Column(col)) = e {

@@ -128,7 +128,7 @@ s)` for `bigdecimal::BigDecimal` here. PostgreSQL falls back to text
 for `BigDecimal`; MySQL is currently the only backend that exchanges
 it as a native decimal value over the wire.
 
-**[`Vec<scalar>`](./field-options.md#scalar-arrays) goes in a `JSON`
+**[`Vec<scalar>`](./vec-scalar-fields.md) goes in a `JSON`
 column.** Toasty serializes the list to a JSON array at bind time and
 parses it back on read. Array predicates (`contains`, `is_superset`,
 `intersects`, `len`, `is_empty`) lower to MySQL's `JSON_CONTAINS`,
@@ -171,6 +171,12 @@ walks backwards from a page cursor.
 comparison, so the match is case-sensitive regardless of the column's collation.
 
 A few things that exist on PostgreSQL are absent here:
+
+**No targeted upsert.** MySQL's `ON DUPLICATE KEY UPDATE` reacts to any primary
+key or unique-index conflict; it cannot restrict the update to the constraint
+named by [`upsert_by_*`](./upserting-records.md). Toasty returns
+`unsupported_feature` instead of updating a row selected by a different
+constraint.
 
 **No `ILIKE`.** MySQL has no `ILIKE` operator, so
 [`.ilike()`](./filtering-with-expressions.md#ilike) is rejected with an

@@ -1,5 +1,5 @@
 use crate::Result;
-use crate::engine::Engine;
+use crate::engine::{Engine, upsert};
 use toasty_core::Error;
 use toasty_core::driver::Capability;
 use toasty_core::{
@@ -40,6 +40,161 @@ impl Engine {
 }
 
 impl stmt::Visit for Verify<'_, '_> {
+    fn visit_stmt_insert(&mut self, i: &stmt::Insert) {
+        stmt::visit::visit_stmt_insert(self, i);
+
+        let Some(upsert) = &i.upsert else {
+            return;
+        };
+        let model = self
+            .schema
+            .app
+            .model(i.target.model_id_unwrap())
+            .as_root_unwrap();
+        let stmt::UpsertTarget::Fields(target) = &upsert.target else {
+            self.record(Error::invalid_statement(
+                "upsert conflict target must contain model fields before lowering",
+            ));
+            return;
+        };
+        let target = target
+            .iter()
+            .filter_map(|projection| projection.as_slice().first().copied())
+            .collect::<Vec<_>>();
+        let Some(index) = model.indices.iter().find(|index| {
+            index.unique
+                && index.fields.len() == target.len()
+                && index
+                    .fields
+                    .iter()
+                    .zip(&target)
+                    .all(|(field, target)| field.field.index == *target)
+        }) else {
+            self.record(Error::invalid_statement(
+                "upsert conflict target must exactly match a unique constraint",
+            ));
+            return;
+        };
+
+        if index.primary_key && !self.capability.upsert_primary_key {
+            self.record(Error::unsupported_feature(format!(
+                "{} does not support primary-key upsert",
+                self.capability.driver_name
+            )));
+        } else if !index.primary_key && !self.capability.upsert_unique {
+            self.record(Error::unsupported_feature(format!(
+                "{} does not support upsert by a secondary unique constraint",
+                self.capability.driver_name
+            )));
+        }
+
+        if upsert.action == stmt::UpsertAction::Ignore && !self.capability.upsert_targeted_ignore {
+            self.record(Error::unsupported_feature(format!(
+                "{} does not support targeted upsert ignore",
+                self.capability.driver_name
+            )));
+        }
+
+        if upsert.action == stmt::UpsertAction::Update
+            && !upsert.update.is_empty()
+            && !self.capability.upsert_branch_assignments
+        {
+            self.record(Error::unsupported_feature(format!(
+                "{} does not support upsert on_update assignments",
+                self.capability.driver_name
+            )));
+        }
+
+        if upsert.action == stmt::UpsertAction::Update
+            && upsert.shared.is_empty()
+            && upsert.update.is_empty()
+        {
+            self.record(Error::invalid_statement(
+                "upsert requires at least one update assignment; use or_ignore() instead",
+            ));
+        }
+
+        for (projection, assignment) in &upsert.shared {
+            let has_default = upsert.defaults.contains(projection);
+            if upsert::requires_current_value(assignment) && !has_default {
+                self.record(Error::invalid_statement(
+                    "shared upsert mutations require a field with #[default]; use on_create and on_update instead",
+                ));
+            }
+        }
+
+        if !self.capability.upsert_branch_assignments && upsert.action == stmt::UpsertAction::Update
+        {
+            for (projection, _) in &upsert.defaults {
+                let used = upsert
+                    .shared
+                    .get(projection)
+                    .is_some_and(upsert::requires_current_value)
+                    || (!upsert.shared.contains(projection) && !upsert.create.contains(projection));
+                if !used {
+                    continue;
+                }
+                let Some(&field) = projection.as_slice().first() else {
+                    continue;
+                };
+                if model.fields[field].nullable {
+                    self.record(Error::unsupported_feature(format!(
+                        "{} does not support nullable upsert field defaults",
+                        self.capability.driver_name
+                    )));
+                }
+            }
+
+            for (projection, _) in &upsert.create {
+                let Some(&field) = projection.as_slice().first() else {
+                    continue;
+                };
+                if model.fields[field].nullable {
+                    self.record(Error::unsupported_feature(format!(
+                        "{} does not support nullable upsert create assignments",
+                        self.capability.driver_name
+                    )));
+                }
+                if upsert.shared.contains(projection) {
+                    self.record(Error::unsupported_feature(format!(
+                        "{} does not support different create and update assignments for one field",
+                        self.capability.driver_name
+                    )));
+                }
+            }
+        }
+
+        if !self.capability.sql && upsert.action == stmt::UpsertAction::Update {
+            for secondary in model
+                .indices
+                .iter()
+                .filter(|index| index.unique && !index.primary_key)
+            {
+                if secondary.fields.iter().any(|field| {
+                    upsert
+                        .shared
+                        .keys()
+                        .any(|projection| projection.as_slice().first() == Some(&field.field.index))
+                        || upsert.create.keys().any(|projection| {
+                            projection.as_slice().first() == Some(&field.field.index)
+                        })
+                        || upsert.defaults.keys().any(|projection| {
+                            projection.as_slice().first() == Some(&field.field.index)
+                        })
+                        || upsert.update.keys().any(|projection| {
+                            projection.as_slice().first() == Some(&field.field.index)
+                        })
+                        || model.fields[field.field.index].auto.is_some()
+                }) {
+                    self.record(Error::unsupported_feature(format!(
+                        "{} upsert does not support updating a unique secondary-index field",
+                        self.capability.driver_name
+                    )));
+                }
+            }
+        }
+    }
+
     fn visit_stmt_delete(&mut self, i: &stmt::Delete) {
         stmt::visit::visit_stmt_delete(self, i);
 
@@ -62,6 +217,8 @@ impl stmt::Visit for Verify<'_, '_> {
 
     fn visit_stmt_select(&mut self, i: &stmt::Select) {
         stmt::visit::visit_stmt_select(self, i);
+
+        self.verify_include_modifiers(i);
 
         VerifyExpr {
             schema: self.schema,
@@ -105,7 +262,13 @@ impl stmt::Visit for Verify<'_, '_> {
 }
 
 impl Verify<'_, '_> {
-    fn verify_offset_key_matches_order_by(&self, i: &stmt::Query) {
+    fn record(&mut self, err: Error) {
+        if self.error.is_none() {
+            *self.error = Some(err);
+        }
+    }
+
+    fn verify_offset_key_matches_order_by(&mut self, i: &stmt::Query) {
         let Some(stmt::Limit::Cursor(cursor)) = i.limit.as_ref() else {
             return;
         };
@@ -122,28 +285,85 @@ impl Verify<'_, '_> {
         }
 
         let Some(order_by) = i.order_by.as_ref() else {
-            todo!("specified offset but no order; stmt={i:#?}");
+            self.record(Error::invalid_statement(
+                "cursor-based pagination requires an ORDER BY clause",
+            ));
+            return;
         };
 
         match after {
             stmt::Expr::Value(stmt::Value::Record(record)) => {
-                if self.capability.sql {
-                    assert!(
-                        order_by.exprs.len() == record.fields.len(),
-                        "order_by = {order_by:#?}"
-                    );
-                }
-                // DDB requires a Record, but the columns counts do not match.
-                // The value is a full key, but the order by clause is just the sort key.
-            }
-            stmt::Expr::Value(_) => {
-                if self.capability.sql {
-                    assert!(order_by.exprs.len() == 1, "order_by = {order_by:#?}");
-                } else {
-                    panic!("NoSQL requires a Record as offset");
+                if record.fields.is_empty() {
+                    self.record(Error::invalid_statement(
+                        "cursor must contain at least one ORDER BY value",
+                    ));
+                } else if record.fields.len() > order_by.exprs.len() {
+                    self.record(Error::invalid_statement(format!(
+                        "cursor contains {} values but the query has {} ORDER BY fields",
+                        record.fields.len(),
+                        order_by.exprs.len(),
+                    )));
                 }
             }
-            _ => todo!("unsupported offset expression; stmt={i:#?}"),
+            // A scalar cursor specifies the first ORDER BY value. This remains
+            // valid when normalization appends hidden tie-breaker fields.
+            stmt::Expr::Value(_) => {}
+            _ => self.record(Error::invalid_statement(
+                "cursor must be a literal value or record",
+            )),
+        }
+    }
+
+    /// Reject include ordering on singular relations and preserve the existing
+    /// rule that filters are rejected only on required singular relations.
+    /// Variant-rooted paths are not resolvable here and pass through unchecked.
+    fn verify_include_modifiers(&mut self, i: &stmt::Select) {
+        for include in i.returning.model_includes() {
+            let Some(query) = &include.query else {
+                continue;
+            };
+            let has_filter = match &query.body {
+                stmt::ExprSet::Select(select) => select.filter.expr.is_some(),
+                _ => false,
+            };
+            let has_order_by = query.order_by.is_some();
+            if !has_filter && !has_order_by {
+                continue;
+            }
+            let Some(model_id) = include.path.root.as_model() else {
+                continue;
+            };
+            let root = self.schema.app.model(model_id);
+            let Some(field) = self
+                .schema
+                .app
+                .resolve_field(root, &include.path.projection)
+            else {
+                continue;
+            };
+            let singular = match &field.ty {
+                app::FieldTy::Has(rel) => rel.is_one(),
+                app::FieldTy::BelongsTo(_) => true,
+                app::FieldTy::Via(via) => via.is_one(),
+                _ => continue,
+            };
+            if has_order_by && singular {
+                self.record(Error::invalid_statement(format!(
+                    "cannot order the include of singular relation `{}`; \
+                     include ordering requires a many-valued relation",
+                    field.name,
+                )));
+                continue;
+            }
+            let required_one = singular && !field.nullable;
+            if has_filter && required_one {
+                self.record(Error::invalid_statement(format!(
+                    "cannot filter the include of required relation `{}`; \
+                     filter the parent query instead",
+                    field.name,
+                )));
+                continue;
+            }
         }
     }
 
@@ -157,25 +377,24 @@ impl Verify<'_, '_> {
         }
     }
 
-    /// Assert that every field inside a `LIMIT` clause is a `Value::I64` literal.
+    /// Assert that every field inside a `LIMIT` clause is an `I64` literal.
     ///
-    /// Builders always normalize integer limits to `I64`, and downstream
-    /// consumers (e.g. `extract_query_pk_limit`) rely on this invariant. Any
-    /// other variant here means either a builder regressed or the AST was
-    /// hand-constructed with a non-canonical shape — both bugs we want to catch
-    /// loudly instead of silently degrading to an unbounded scan.
+    /// Runtime pagination fields use `Expr::Value`; the fixed limit from
+    /// `.first()` uses `Expr::Static`. Downstream consumers rely on this
+    /// invariant. Any other form means either a builder regressed or the AST was
+    /// hand-constructed with a non-canonical shape.
     fn verify_limit_is_integer_literal(&self, i: &stmt::Query) {
         let Some(limit) = i.limit.as_ref() else {
             return;
         };
         match limit {
             stmt::Limit::Cursor(c) => {
-                assert_i64_literal(&c.page_size, "Cursor page_size");
+                assert_i64_value(&c.page_size, "Cursor page_size");
             }
             stmt::Limit::Offset(o) => {
                 assert_i64_literal(&o.limit, "Offset limit");
                 if let Some(off) = o.offset.as_ref() {
-                    assert_i64_literal(off, "Offset offset");
+                    assert_i64_value(off, "Offset offset");
                 }
             }
         }
@@ -184,6 +403,17 @@ impl Verify<'_, '_> {
 
 #[track_caller]
 fn assert_i64_literal(expr: &stmt::Expr, what: &str) {
+    assert!(
+        matches!(
+            expr,
+            stmt::Expr::Value(stmt::Value::I64(_)) | stmt::Expr::Static(stmt::Value::I64(_))
+        ),
+        "{what} must be an I64 literal; got {expr:#?}"
+    );
+}
+
+#[track_caller]
+fn assert_i64_value(expr: &stmt::Expr, what: &str) {
     assert!(
         matches!(expr, stmt::Expr::Value(stmt::Value::I64(_))),
         "{what} must be a Value::I64 literal; got {expr:#?}"
@@ -347,28 +577,30 @@ impl stmt::Visit for VerifyExpr<'_, '_> {
         // case-insensitive match on any other backend rather than silently
         // emitting plain `LIKE`, whose case behavior differs across engines.
         if i.case_insensitive && !self.capability.native_ilike {
-            self.record(Error::unsupported_feature(
-                "ilike requires a native ILIKE operator, which only PostgreSQL provides; \
-                 use like instead",
-            ));
+            self.record(Error::unsupported_feature(format!(
+                "{} does not provide a native ILIKE operator; use like instead",
+                self.capability.driver_name
+            )));
         }
         stmt::visit::visit_expr_like(self, i);
     }
 
     fn visit_expr_is_superset(&mut self, i: &stmt::ExprIsSuperset) {
         if !self.capability.native_array_set_predicates && !rhs_is_concrete_list(&i.rhs) {
-            self.record(Error::unsupported_feature(
-                "is_superset on this driver requires a literal list on the right-hand side",
-            ));
+            self.record(Error::unsupported_feature(format!(
+                "{} requires a literal list on the right-hand side of is_superset",
+                self.capability.driver_name
+            )));
         }
         stmt::visit::visit_expr_is_superset(self, i);
     }
 
     fn visit_expr_intersects(&mut self, i: &stmt::ExprIntersects) {
         if !self.capability.native_array_set_predicates && !rhs_is_concrete_list(&i.rhs) {
-            self.record(Error::unsupported_feature(
-                "intersects on this driver requires a literal list on the right-hand side",
-            ));
+            self.record(Error::unsupported_feature(format!(
+                "{} requires a literal list on the right-hand side of intersects",
+                self.capability.driver_name
+            )));
         }
         stmt::visit::visit_expr_intersects(self, i);
     }
@@ -488,6 +720,7 @@ mod tests {
         let err = verify_expr_with(&Capability::SQLITE, &expr)
             .expect("expected unsupported_feature error");
         assert!(err.is_unsupported_feature());
+        assert!(err.to_string().contains(Capability::SQLITE.driver_name));
     }
 
     #[test]
