@@ -12,7 +12,7 @@ env:
   RUST_BACKTRACE: 1
   # Pinned so a new Rust release cannot break CI on its own. Bumped
   # automatically by Renovate; see .github/renovate.json5.
-  RUST_STABLE_VERSION: "1.95.0"
+  RUST_STABLE_VERSION: "1.97.1"
   # The MySQL service container eats into the 16 GB runner budget, and
   # the integration test crate currently expands a lot of generated
   # code per inline test model. With 4 parallel rustc instances the
@@ -261,6 +261,18 @@ jobs:
         run: cargo test --no-default-features --features dynamodb -- --test-threads 1
       - name: cargo test -p toasty-driver-dynamodb
         run: cargo test -p toasty-driver-dynamodb -- --test-threads 1
+
+  test-turso:
+    needs: check
+    name: Run tests for Turso
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-turso-sync
+        id: turso-sync
+        env:
+          TOASTY_TEST_TURSO_SYNC_URL: ${{ steps.turso-sync.outputs.sync-url }}
+      - run: cargo test -p toasty-driver-turso --features sync
 
   test-all-os:
     needs: check

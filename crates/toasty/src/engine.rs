@@ -1,3 +1,8 @@
+// Statement effect classification.  The consumer (pool retry wrapper)
+// lands in a follow-up PR per `docs/dev/design/retry-safe-recovery.md`;
+// allow dead code until then.
+#[allow(dead_code)]
+pub(crate) mod effect;
 pub(crate) mod eval;
 pub(crate) mod exec;
 
@@ -13,11 +18,13 @@ mod index;
 mod legalize;
 mod lower;
 mod mir;
+mod normalize;
 mod plan;
 mod select_item;
 pub(crate) use select_item::{SelectItem, SelectItems};
 mod simplify;
 mod ty;
+mod upsert;
 mod verify;
 
 use crate::Result;
@@ -37,11 +44,12 @@ use toasty_core::{
 ///
 /// The execution pipeline follows this process:
 ///
-/// 1. **Verification.** Validate statement structure and reject AST shapes
+/// 1. **Normalization.** Expand implicit application-level semantics.
+/// 2. **Verification.** Validate statement structure and reject AST shapes
 ///    the driver does not support.
-/// 2. **Lowering.** Convert to HIR with dependency tracking.
-/// 3. **Planning.** Build MIR operation graph.
-/// 4. **Execution.** Run actions against the database driver. Each
+/// 3. **Lowering.** Convert to HIR with dependency tracking.
+/// 4. **Planning.** Build MIR operation graph.
+/// 5. **Execution.** Run actions against the database driver. Each
 ///    driver-bound statement is legalized for the target backend and its
 ///    bind parameters extracted ([`prepare_for_driver`](Self::prepare_for_driver))
 ///    immediately before it crosses to the driver.
@@ -73,9 +81,10 @@ impl Engine {
     pub(crate) async fn exec(
         &self,
         connection: &mut dyn Connection,
-        stmt: Statement,
+        mut stmt: Statement,
         in_transaction: bool,
     ) -> Result<toasty_core::driver::ExecResponse> {
+        self.normalize_stmt(&mut stmt)?;
         self.verify(&stmt)?;
 
         // Lower the statement to High-level intermediate representation
@@ -102,9 +111,10 @@ impl Engine {
         raw: RawSql,
     ) -> Result<toasty_core::driver::ExecResponse> {
         if !self.capability.sql {
-            return Err(toasty_core::Error::unsupported_feature(
-                "raw SQL is only supported by SQL drivers",
-            ));
+            return Err(toasty_core::Error::unsupported_feature(format!(
+                "{} does not support raw SQL",
+                self.capability.driver_name
+            )));
         }
 
         connection.exec(&self.schema, raw.into()).await

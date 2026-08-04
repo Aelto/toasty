@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use toasty_core::{
     driver::Capability,
     schema::{
-        db::{Column, Schema, Table, Type, TypeEnum},
+        db::{Column, Schema, Table, TableId, Type, TypeEnum},
         diff,
     },
 };
@@ -22,13 +22,24 @@ fn is_named_enum_variant_only_change(previous: &Column, next: &Column) -> bool {
         return false;
     }
 
-    matches!(
+    // A scalar ↔ array change is a real column type change, so both sides
+    // must have the same shape.
+    let same_shape = matches!(
         (&previous.storage_ty, &next.storage_ty),
-        (
-            Type::Enum(TypeEnum { name: Some(a), .. }),
-            Type::Enum(TypeEnum { name: Some(b), .. }),
-        ) if a == b
-    )
+        (Type::Enum(_), Type::Enum(_)) | (Type::List(_), Type::List(_))
+    );
+
+    same_shape
+        && matches!(
+            (
+                previous.storage_ty.named_enum(),
+                next.storage_ty.named_enum(),
+            ),
+            (
+                Some(TypeEnum { name: Some(a), .. }),
+                Some(TypeEnum { name: Some(b), .. }),
+            ) if a == b
+        )
 }
 
 /// A migration step pairing a DDL [`Statement`] with the [`Schema`] it applies against.
@@ -133,6 +144,26 @@ impl<'a> MigrationStatement<'a> {
                             )
                         });
 
+                    // Drop existing indices before changing columns because they may
+                    // reference a column that is being removed or altered.
+                    for item in indices.iter() {
+                        match item {
+                            diff::Index::Drop(index) => {
+                                result.push(Self::new(
+                                    Statement::drop_index(index),
+                                    Cow::Borrowed(schema_diff.previous()),
+                                ));
+                            }
+                            diff::Index::Alter { previous, .. } => {
+                                result.push(Self::new(
+                                    Statement::drop_index(previous),
+                                    Cow::Borrowed(schema_diff.previous()),
+                                ));
+                            }
+                            diff::Index::Create(_) => {}
+                        }
+                    }
+
                     if needs_recreation {
                         Self::emit_table_recreation(
                             &mut result,
@@ -143,10 +174,17 @@ impl<'a> MigrationStatement<'a> {
                             capability,
                         );
                     } else {
-                        Self::emit_column_changes(&mut result, schema, columns, capability);
+                        Self::emit_column_changes(
+                            &mut result,
+                            schema,
+                            previous.id,
+                            columns,
+                            capability,
+                        );
                     }
 
-                    // Indices diff
+                    // Create new indices after the column changes so they reference
+                    // the next schema's column definitions.
                     for item in indices.iter() {
                         match item {
                             diff::Index::Create(index) => {
@@ -155,22 +193,13 @@ impl<'a> MigrationStatement<'a> {
                                     Cow::Borrowed(schema_diff.next()),
                                 ));
                             }
-                            diff::Index::Drop(index) => {
-                                result.push(Self::new(
-                                    Statement::drop_index(index),
-                                    Cow::Borrowed(schema_diff.previous()),
-                                ));
-                            }
-                            diff::Index::Alter { previous, next } => {
-                                result.push(Self::new(
-                                    Statement::drop_index(previous),
-                                    Cow::Borrowed(schema_diff.previous()),
-                                ));
+                            diff::Index::Alter { next, .. } => {
                                 result.push(Self::new(
                                     Statement::create_index(next),
                                     Cow::Borrowed(schema_diff.next()),
                                 ));
                             }
+                            diff::Index::Drop(_) => {}
                         }
                     }
                 }
@@ -278,6 +307,7 @@ impl<'a> MigrationStatement<'a> {
     fn emit_column_changes(
         result: &mut Vec<Self>,
         schema: Cow<'a, Schema>,
+        table: TableId,
         columns: &[diff::Column<'_>],
         capability: &Capability,
     ) {
@@ -285,7 +315,7 @@ impl<'a> MigrationStatement<'a> {
             match item {
                 diff::Column::Add(column) => {
                     result.push(Self::new(
-                        Statement::add_column(column, capability),
+                        Statement::add_column(table, column, capability),
                         schema.clone(),
                     ));
                 }
