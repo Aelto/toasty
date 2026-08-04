@@ -23,6 +23,10 @@ use toasty_core::{
 /// past) the underlying driver.
 #[derive(Debug, Clone)]
 pub enum Fault {
+    /// Causes the next `exec` to return `Error::driver_operation_failed`
+    /// without touching the underlying connection or marking it invalid.
+    OperationFailed,
+
     /// Causes the next `exec` to return `Error::connection_lost` without
     /// touching the underlying connection. The wrapping
     /// `InstrumentedConnection`'s `is_valid` flips to `false`, mirroring
@@ -82,6 +86,21 @@ impl InstrumentedHandle {
     #[track_caller]
     pub fn pop_op(&self) -> Operation {
         self.pop().0
+    }
+
+    /// Remove and return the last operation from the log
+    #[track_caller]
+    pub fn pop_last(&self) -> (Operation, ExecResponse) {
+        let mut ops = self.inner.ops_log.lock().unwrap();
+        let Some(driver_op) = ops.pop() else {
+            panic!("no operations in log");
+        };
+        (driver_op.operation, driver_op.response)
+    }
+
+    #[track_caller]
+    pub fn pop_last_op(&self) -> Operation {
+        self.pop_last().0
     }
 
     /// Queue a fault to fire on the next driver `exec` call. Faults fire
@@ -186,6 +205,11 @@ impl Connection for InstrumentedConnection {
             .pop_front();
         if let Some(fault) = fault {
             match fault {
+                Fault::OperationFailed => {
+                    return Err(toasty_core::Error::driver_operation_failed(
+                        std::io::Error::other("injected operation failure"),
+                    ));
+                }
                 Fault::ConnectionLost => {
                     self.valid.store(false, Ordering::Release);
                     return Err(toasty_core::Error::connection_lost(std::io::Error::other(
@@ -249,6 +273,11 @@ impl Connection for InstrumentedConnection {
             .pop_front();
         if let Some(fault) = fault {
             match fault {
+                Fault::OperationFailed => {
+                    return Err(toasty_core::Error::driver_operation_failed(
+                        std::io::Error::other("injected operation failure"),
+                    ));
+                }
                 Fault::ConnectionLost => {
                     self.valid.store(false, Ordering::Release);
                     return Err(toasty_core::Error::connection_lost(std::io::Error::other(

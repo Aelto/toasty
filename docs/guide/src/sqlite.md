@@ -137,9 +137,15 @@ mutations, [batch operations](./batch-operations.md),
 [pagination in both directions](./sorting-limits-and-pagination.md),
 [embedded types](./embedded-types.md),
 [`#[unique]`](./indexes-and-unique-constraints.md#unique-fields),
+[`upsert_by_*`](./upserting-records.md),
 [association preloading](./preloading-associations.md), and
 serializable [transactions](./transactions.md) all run natively. A few
 behaviors differ from the other SQL backends:
+
+**Targeted upsert.** SQLite executes `upsert_by_*` with `INSERT ... ON
+CONFLICT`. Primary keys and unique constraints can be conflict targets, and
+`on_create`, `on_update`, and `or_ignore` are supported. Turso uses the same
+upsert behavior.
 
 **`LIKE` is case-insensitive for ASCII.** SQLite's `LIKE` ignores case for ASCII
 characters but is case-sensitive for non-ASCII ones. A
@@ -161,7 +167,7 @@ lowers to `col GLOB 'abc*'`, a case-sensitive prefix match. The optimizer can
 use a regular index for the common-prefix lookup.
 
 **Scalar arrays use JSON1.** A
-[`Vec<T>` field](./field-options.md#scalar-arrays) lives in a `TEXT`
+[`Vec<T>` field](./vec-scalar-fields.md) lives in a `TEXT`
 column holding a JSON array. The array predicates lower to JSON1
 expressions:
 
@@ -174,7 +180,7 @@ expressions:
 
 These subqueries scan the JSON document, so array predicates against
 a large table do not use an index. See
-[Field Options](./field-options.md#scalar-arrays) for the model-level
+[`Vec<scalar>` Fields](./vec-scalar-fields.md) for the model-level
 view.
 
 **No row-level locking.** SQLite has no `SELECT ... FOR UPDATE`.

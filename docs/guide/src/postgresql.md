@@ -116,7 +116,12 @@ want native `NUMERIC`.
 Toasty enables these features automatically when the driver is
 PostgreSQL. No configuration is required.
 
-**Native arrays for [`Vec<scalar>` fields](./field-options.md#scalar-arrays).**
+**Targeted upsert.** PostgreSQL executes
+[`upsert_by_*`](./upserting-records.md) with `INSERT ... ON CONFLICT`.
+Primary keys and unique constraints can be conflict targets, and
+`on_create`, `on_update`, and `or_ignore` are supported.
+
+**Native arrays for [`Vec<scalar>` fields](./vec-scalar-fields.md).**
 A `tags: Vec<String>` field is a `text[]` column. The array predicates
 (`contains`, `is_superset`, `intersects`, `len`, `is_empty`) lower to
 PostgreSQL's native operators (`= ANY(col)`, `@>`, `&&`,

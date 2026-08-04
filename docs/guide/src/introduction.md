@@ -8,7 +8,7 @@ You define your models as Rust structs and annotate them with
 annotated structs — field types map to column types, and attributes like
 `#[key]`, `#[unique]`, and `#[index]` control the schema. You can customize the
 mapping with attributes for table names, column names, and column types. Toasty's
-derive macro also generates query builders, create/update builders, and
+derive macro also generates query builders, create/update/upsert builders, and
 relationship accessors at compile time.
 
 ```rust
@@ -49,17 +49,22 @@ transactions.
 - **[Creating Records](./creating-records.md)** — insert one or many records
 - **[Querying Records](./querying-records.md)** — find, filter, and iterate over results
 - **[Updating Records](./updating-records.md)** — modify existing records
+- **[Upserting Records](./upserting-records.md)** — create or update atomically by a key or unique constraint
 - **[Deleting Records](./deleting-records.md)** — remove records
 - **[Indexes and Unique Constraints](./indexes-and-unique-constraints.md)** — add indexes and unique constraints
-- **[Field Options](./field-options.md)** — column names, types, defaults, and JSON serialization
+- **[Field Options](./field-options.md)** — column names, types, defaults, and update expressions
 - **[Relationships](./relationships.md)** — overview of how models connect to each other
 - **[BelongsTo](./belongs-to.md)** — define and use many-to-one relationships
 - **[HasMany](./has-many.md)** — define and use one-to-many relationships
+- **[Many-to-Many](./many-to-many.md)** — connect two models through a join model
 - **[HasOne](./has-one.md)** — define and use one-to-one relationships
 - **[Preloading Associations](./preloading-associations.md)** — eager loading to avoid extra queries
 - **[Filtering with Expressions](./filtering-with-expressions.md)** — comparisons, AND/OR, and more
 - **[Sorting, Limits, and Pagination](./sorting-limits-and-pagination.md)** — order results and paginate
 - **[Embedded Types](./embedded-types.md)** — store structs and enums inline
+- **[`#[document]` Fields](./document-fields.md)** — store an embedded struct in one document with queryable scalar leaves
+- **[JSON Encoding](./json-encoding.md)** — store a serde type or `serde_json::Value` in one opaque column
+- **[`Vec<scalar>` Fields](./vec-scalar-fields.md)** — store and query a scalar collection in one field
 - **[Batch Operations](./batch-operations.md)** — multiple queries in one round-trip
 - **[Transactions](./transactions.md)** — atomic operations
 - **[Database Setup](./database-setup.md)** — connection URLs, table creation, and supported databases
